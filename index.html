@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GT · 分割图集</title>
+<link rel="stylesheet" href="/style.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header><div class="brand"><div class="logo">GT</div><div><h1>分割图集</h1><p class="sub" id="dataset">EM × GT × S0 · 按聚类关系浏览</p></div></div><span class="badge">只读查看 · 不修改标签</span></header>
+<main>
+ <div class="toolbar">
+  <nav class="tabs" aria-label="聚类标签筛选"><button data-tag="1v0" aria-pressed="true">1v0 <span>—</span></button><button data-tag="1v1" aria-pressed="false">1v1 <span>—</span></button><button data-tag="1vn" aria-pressed="false">1vn <span>—</span></button></nav>
+  <div class="display-controls"><label>显示 <select id="mode"><option value="both">GT 轮廓 + S0 填色</option><option value="gt">仅 GT 叠加</option><option value="s0">仅 S0 叠加</option><option value="em">EM 原图</option></select></label><label>叠加强度 <input id="opacity" type="range" min="0" max="100" value="48"><output id="opacity-value">48%</output></label></div>
+ </div>
+ <div class="section-heading"><div><h2 id="heading">未关联 S0 的 GT</h2><p class="sub" id="description">每张卡片对应一个 GT，显示它最清楚的切片。</p></div><span id="result-count" class="sub"></span></div>
+ <div class="guide"><span>图上滚轮 / 方向键：切片 · 点击图片：放大 · 代表切片覆盖可共同出现的 S0</span><span>Z 从 0 开始 · 颜色不表示 GT / S0 的匹配关系</span></div>
+ <div id="status" role="status">正在读取数据…</div><div id="error" role="alert" hidden></div>
+ <section id="gallery" class="gallery" aria-label="GT 图集"></section>
+ <div id="empty" class="empty" hidden>该标签下没有 GT。请选择其他标签。</div>
+ <nav class="pagination" aria-label="图集翻页"><button id="prev-page" disabled>← 上一页</button><label>第 <input id="page-number" type="number" min="1" value="1" aria-label="页码"> / <span id="pages">1</span> 页</label><button id="next-page" disabled>下一页 →</button><span class="sub">每页 8 张</span></nav>
+</main>
+<dialog id="detail"><div class="detail-head"><strong>切片详情</strong><span class="sub">滚轮换切片 · Esc 关闭</span><button id="close-detail" aria-label="关闭详情">关闭 ×</button></div><div id="detail-body"></div></dialog>
+<template id="card-template">
+ <article class="card">
+  <div class="card-head"><h3></h3><span class="tag-pill"></span></div>
+  <div class="image-wrap"><canvas tabindex="0" role="button"></canvas><span class="z-badge"></span><span class="image-message">正在加载切片…</span></div>
+  <div class="card-content">
+   <div class="slice-controls"><button class="prev-slice" aria-label="上一切片">←</button><input class="slice-range" type="range" min="0" value="0" aria-label="切片序号"><button class="next-slice" aria-label="下一切片">→</button><span class="slice-counter"></span></div>
+   <div class="slice-options"><label>浏览 <select class="slice-scope"><option value="joint">共存切片</option><option value="gt">GT 全部切片</option></select></label><button class="reset-slice">推荐视图</button></div>
+   <div class="coverage"></div><div class="recommendations" aria-label="代表切片"></div>
+   <div class="legend"></div><p class="warning" hidden></p>
+   <details class="s0-details"><summary></summary><div class="s0-list"></div></details>
+  </div>
+ </article>
+</template>
+</body>
+</html>

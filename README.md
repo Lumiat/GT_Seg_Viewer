@@ -1,0 +1,74 @@
+# GT 分割图集
+
+按聚类 CSV 中的 `tag` 浏览 GT，每页最多 8 张 EM 卡片，桌面端四列两行，小屏自动调整列数。沿用 `em_seg_viewer` 的输入参数、48 色色盘与浅灰 / 白色 / 蓝色界面；此目录可以独立复制运行。
+
+## 启动
+
+Python 3.10 或更新版本，安装依赖后，从 `preprocess` 目录运行：
+
+```bash
+python -m pip install -r GT_Seg_Viewer/requirements.txt
+bash GT_Seg_Viewer/run.sh \
+  --inputs /你的/inputs目录 \
+  --cluster results/s0_cluster_by_gt_filter_by_T_50.csv
+```
+
+打开 **http://localhost:18769**。远程运行可在 VS Code 转发端口 18769。`Ctrl+C` 停止服务。
+
+Windows PowerShell 也可以直接运行：
+
+```powershell
+python GT_Seg_Viewer/viewer.py --inputs "D:/你的/inputs目录" --cluster results/s0_cluster_by_gt_filter_by_T_50.csv
+```
+
+参数：
+
+| 参数 | 默认值 / 用途 |
+| --- | --- |
+| `--cluster` | 必填，聚类 CSV 路径 |
+| `--inputs` | 与原工具相同，`preprocess` 的上两级目录中的 `Proofread-data/inputs` |
+| `--em-key` | `inputs` |
+| `--gt-key` | `labels` |
+| `--host` | `127.0.0.1` |
+| `--port` | `18769`，可与原查看器同时运行 |
+
+`--cluster`、`--inputs` 的相对路径均相对于**执行命令时所在目录**，脚本不会切换工作目录。可用 `GT_VIEWER_PYTHON=/path/to/python bash GT_Seg_Viewer/run.sh ...` 指定环境，也兼容 `EM_VIEWER_PYTHON` 及原工具的 `pf-service` 环境。
+
+## 输入
+
+源数据目录包含 `em.h5`、`gt.h5`、`s0.npy`。三者须同尺寸、同坐标，轴序为 ZYX；EM 为 uint8 灰度，标签为非负整数，0 是背景。不执行重采样或配准。
+
+```csv
+gt_id,tag,s0_count_per_gt,covered_s0_id
+10,1v0,0,
+20,1v1,1,42
+30,1vn,3,"51,52,53"
+```
+
+`covered_s0_id` 含多个 ID 时须按标准 CSV 加双引号。ID 始终使用原始非零 uint64 十进制整数，前端以字符串处理，不损失大整数精度。每个 GT 一行；重复 GT、非法 tag、缺列、错列均会在启动时报错。允许 UTF-8 BOM 和额外列。`1vn` 按 CSV 标签原样筛选，也支持图连通分量导出的仅一个 S0 的 `1vn`。
+
+显示对象以 `covered_s0_id` 为准。`s0_count_per_gt` 与实际列表不一致时显示提示（兼容旧版 `1v1` 计数为 0 的文件）。`1v0` 表示该 CSV 没有关联 S0，并不意味着体数据中 GT 附近没有任何 S0。
+
+## 操作与切片选择
+
+- 左上角 **1v0 / 1v1 / 1vn** 按 CSV 原始标签筛选，按钮附带 GT 总数。保持 CSV 行顺序，每页 8 张，最后一页显示剩余条目，可直接输入页码。
+- **1v0** 默认选 GT 面积最大的切片；**1v1 / 1vn** 优先选 GT 与最多关联 S0 共同存在的切片，数量相同时比较可见面积。
+- 若所有关联 S0 无法在同一 Z 与 GT 共存，使用贪心覆盖选择一组**代表切片**，保证每个能与 GT 共存的 S0 至少被其中一张覆盖。它不保证切片数量是数学意义上的最小值。
+- 在图上**滚轮**、聚焦图片后的**方向键**、卡片滑块或左右按钮可浏览全部共存切片，按 Z 顺序跳过不共存的层。也可切为 **GT 全部切片**。`Z` 是源数据中从 0 开始的绝对层号。
+- 点击代表切片按钮直接跳转；展开 **关联 S0 列表** 后点击 ID 可定位它与 GT 共存的切片。当前切片可见的 S0 会着色标记。
+- 无共同 Z 的 S0 明确提示，允许单独定位，并标明 GT 不在场；体数据中缺失的 ID 禁用定位。GT 缺失时显示异常卡片，不假造共存切片。
+- 默认 **GT 轮廓 + S0 填色**，二者显示于同一张 EM 上；没有 S0 的 GT 区域也有淡色填充。可以切换仅 GT、仅 S0、EM 原图和叠加强度。图中仅高亮当前 GT 及 CSV 指定的 S0，保留它们完整的切片范围并自动加边距。
+- 点击图片打开大图，仍可切片、查找 S0；按 Esc 关闭。不同命名空间的相同颜色不表示匹配，按 ID / 图例判断。
+
+首次打开会逐 Z 扫描 GT 和 S0 建立内存索引，页面显示进度。S0 使用只读内存映射，HDF5 按层读取；不加载完整体数据，不写输入文件。重启后重新索引。切片按目标联合包围盒裁剪，保留原始分辨率；极大切片或跨越整幅图的对象会增加网络和浏览器内存用量。
+
+## 验证
+
+```bash
+python -m pip install httpx
+cd GT_Seg_Viewer
+python -m unittest -v test_viewer.py
+node --check app.js
+```
+
+测试仅生成临时合成数据，覆盖分页、标签筛选、共同 Z / 分散 Z / 缺失对象、uint64 精度、裁剪坐标、非法输入以及源文件只读性。

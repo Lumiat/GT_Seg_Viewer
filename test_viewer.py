@@ -1,0 +1,157 @@
+"""Synthetic fixtures only; real input volumes are never modified."""
+import csv
+import json
+from pathlib import Path
+import struct
+import tempfile
+import unittest
+
+import h5py
+import numpy as np
+from fastapi.testclient import TestClient
+
+from viewer import FIELDS, Gallery, make_app, plan_slices, read_clusters
+
+
+def write_csv(path, rows):
+    with path.open('w', encoding='utf-8-sig', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(FIELDS)
+        writer.writerows(rows)
+
+
+def make_fixture(root):
+    large = 2**63 + 17
+    gt = np.zeros((5, 24, 32), dtype=np.uint64)
+    s0 = np.zeros_like(gt)
+    gt[:3, 3:12, 3:12] = 1
+    gt[0, 15:19, 2:6] = large
+    gt[1, 15:19, 2:6] = large + 1
+    s0[0, 3:7, 3:7] = 101
+    s0[1, 3:7, 3:7] = 102
+    s0[2, 3:7, 3:7] = 103
+    s0[4, 3:7, 3:7] = 104  # Exists, never shares a Z with GT 1.
+    s0[0, 15:19, 2:6] = large
+    s0[0, 15:19, 6:8] = large + 1
+    for i in range(2, 12):
+        gt[3, i, 20:23] = i
+    em = np.arange(np.prod(gt.shape), dtype=np.uint8).reshape(gt.shape)
+    for name, key, data in [('em.h5', 'inputs', em), ('gt.h5', 'labels', gt)]:
+        with h5py.File(root / name, 'w') as f:
+            f[key] = data
+    np.save(root / 's0.npy', s0)
+    write_csv(root / 'cluster.csv', [
+        [1, '1vn', 5, '101,102,103,104,999'],
+        [large, '1v1', 0, str(large)],  # Legacy CSV count is allowed.
+        [large + 1, '1vn', 2, f'{large},{large+1}'],
+        [999, '1v1', 1, '101'],
+        *[[i, '1v0', 0, ''] for i in range(2, 12)],
+    ])
+    return gt, s0
+
+
+class ViewerTests(unittest.TestCase):
+    def test_joint_slice_cover_includes_every_coexistent_s0(self):
+        row = dict(gt_id='1', tag='1vn', s0_count_per_gt=5, covered_s0_id=['11', '12', '13', '14', '15'])
+        index = {'gt': {1: {0: 4, 1: 9, 2: 10}}, 's0': {
+            11: {0: 8}, 12: {0: 2, 1: 8}, 13: {2: 6}, 14: {4: 8}}}
+        plan = plan_slices(row, index)
+        self.assertEqual(plan['initial_z'], 0)  # Most S0s beats greater GT area.
+        self.assertEqual(plan['recommended_z'], [0, 2])
+        self.assertEqual(plan['missing_s0'], ['15'])
+        self.assertEqual(plan['disjoint_s0'], ['14'])
+        covered = {s for item in plan['slices'] if item['z'] in plan['recommended_z'] for s in item['s0_ids']}
+        self.assertEqual(covered, {'11', '12', '13'})
+        self.assertFalse(plan['all_together'])
+        row['covered_s0_id'] = ['11', '12']
+        self.assertTrue(plan_slices(row, index)['all_together'])
+
+    def test_csv_validation_and_exact_uint64(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'cluster.csv'
+            write_csv(path, [[2**64-1, '1vn', 2, f'{2**63},{2**63+1}']])
+            row = read_clusters(path)[0]
+            self.assertEqual(row['gt_id'], str(2**64-1))
+            self.assertEqual(row['covered_s0_id'], [str(2**63), str(2**63+1)])
+            for data in [[[0, '1v0', 0, '']], [[2**64, '1v0', 0, '']],
+                         [[1, 'bad', 0, '']], [[1, '1v0', 1, '2']],
+                         [[1, '1v1', 0, '']], [[1, '1v0', 0, ''], [1, '1v0', 0, '']]]:
+                write_csv(path, data)
+                with self.assertRaises(ValueError):
+                    read_clusters(path)
+            path.write_text('gt_id,tag,s0_count_per_gt,covered_s0_id\n1,1vn,2,2,3\n')
+            with self.assertRaises(ValueError):
+                read_clusters(path)
+
+    def test_frames_preserve_coordinates_labels_and_input_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            gt, s0 = make_fixture(root)
+            v = Gallery(root, root / 'cluster.csv')
+            v.build_index()
+            self.assertEqual(v.state, 'ready')
+            plan = v.plan('1')
+            self.assertEqual(plan['recommended_z'], [0, 1, 2])
+            self.assertEqual(plan['missing_s0'], ['999'])
+            self.assertEqual(plan['disjoint_s0'], ['104'])
+            large = str(2**63 + 17)
+            payload = v.frame(large, 0)
+            magic, w, h, n = struct.unpack('<4sIII', payload[:16])
+            meta = json.loads(payload[16:16+n])
+            self.assertEqual(magic, b'GSV1')
+            self.assertEqual(meta['present_s0'], [large])
+            self.assertEqual(meta['s0_ids'], ['0', large])
+            self.assertEqual(len(payload), 16+n+w*h*6)
+            x0, y0, x1, y1 = meta['bbox_xy']
+            gmask = np.frombuffer(payload, dtype=np.uint8, offset=16+n+w*h, count=w*h).reshape(h,w)
+            self.assertTrue(np.array_equal(gmask, gt[0,y0:y1,x0:x1] == int(large)))
+            slots = np.frombuffer(payload, dtype='<u4', offset=16+n+2*w*h).reshape(h,w)
+            self.assertTrue(np.array_equal(slots == 1, s0[0,y0:y1,x0:x1] == int(large)))
+            self.assertTrue(v.plan('999')['gt_missing'])
+            self.assertIsNone(v.plan('999')['initial_z'])
+            for z in range(5):
+                v.frame('1', z)
+            self.assertLessEqual(len(v.cache), 2)
+            self.assertTrue(np.array_equal(np.load(root / 's0.npy'), s0))
+            with h5py.File(root / 'gt.h5') as f:
+                self.assertTrue(np.array_equal(f['labels'][:], gt))
+            v.close()
+
+    def test_api_pagination_filters_errors_and_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_fixture(root)
+            app = make_app(root, root / 'cluster.csv')
+            app.state.gallery.build_index()
+            with TestClient(app) as client:
+                info = client.get('/api/info').json()
+                self.assertEqual(info['counts'], {'1v0': 10, '1v1': 2, '1vn': 2})
+                first = client.get('/api/clusters?tag=1v0&page=1').json()
+                last = client.get('/api/clusters?tag=1v0&page=2').json()
+                self.assertEqual((len(first['items']), len(last['items'])), (8, 2))
+                self.assertEqual({r['gt_id'] for r in first['items']} & {r['gt_id'] for r in last['items']}, set())
+                self.assertEqual(first['pages'], 2)
+                for url in ['/api/clusters?tag=bad', '/api/clusters?page=0', '/api/clusters?tag=1v0&page=3', '/api/frame/1/5']:
+                    self.assertEqual(client.get(url).status_code, 400, url)
+                self.assertEqual(client.get('/api/frame/10000/0').status_code, 404)
+                self.assertEqual(client.get('/api/frame/1/0').content[:4], b'GSV1')
+                for url in ['/', '/app.js', '/style.css']:
+                    self.assertEqual(client.get(url).status_code, 200)
+
+    def test_empty_category_and_wrong_volume_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_fixture(root)
+            write_csv(root / 'cluster.csv', [[1, '1v0', 0, '']])
+            app = make_app(root, root / 'cluster.csv')
+            app.state.gallery.build_index()
+            with TestClient(app) as client:
+                empty = client.get('/api/clusters?tag=1vn').json()
+                self.assertEqual((empty['items'], empty['total'], empty['pages']), ([], 0, 1))
+            np.save(root / 's0.npy', np.zeros((2, 3, 4), dtype=np.uint16))
+            with self.assertRaises(ValueError):
+                Gallery(root, root / 'cluster.csv')
+
+
+if __name__ == '__main__':
+    unittest.main()
