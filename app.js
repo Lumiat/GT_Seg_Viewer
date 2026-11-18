@@ -45,8 +45,11 @@ function viewTransform(card,width,height){
  if(card.focusBounds){
   const [x0,y0,x1,y1]=card.focusBounds;
   const base=Math.min(width/card.surface.width,height/card.surface.height);
-  // Fit the complete object (including disconnected parts) with 10% padding per side.
-  card.zoom=Math.max(1,Math.min(width/((x1-x0)*1.2),height/((y1-y0)*1.2))/base);
+  // Use the visible viewport, allowing zoom < 1 when the full object needs margins.
+  // The safe inset also keeps every S0 pixel clear of rounded corners and the Z badge.
+  const dpr=card.renderDpr||1,inset=Math.min(36*dpr,width*.15,height*.15);
+  card.zoom=Math.min((width-2*inset)/((x1-x0)*1.2),(height-2*inset)/((y1-y0)*1.2))/base;
+  card.minZoom=Math.min(1,card.zoom);
   card.maxZoom=Math.max(16,card.zoom);
   card.cx=(x0+x1)/2;card.cy=(y0+y1)/2;
  }
@@ -60,27 +63,37 @@ function viewTransform(card,width,height){
  return {s,x:width/2-card.cx*s,y:height/2-card.cy*s};
 }
 function focusS0(card,id){
- const p=card.frame,slot=p.meta.s0_ids.indexOf(id);if(slot<=0)return;
- let x0=p.w,y0=p.h,x1=0,y1=0;
+ const p=card.frame,slot=p.meta.s0_ids.indexOf(id);
+ if(slot<=0)throw Error('目标 S0 不在返回的切片中');
+ let x0=p.w,y0=p.h,x1=0,y1=0,count=0;
  for(let i=0;i<p.s0.length;i++)if(p.s0[i]===slot){
+  count++;
   const x=i%p.w,y=Math.floor(i/p.w);
   x0=Math.min(x0,x);y0=Math.min(y0,y);x1=Math.max(x1,x+1);y1=Math.max(y1,y+1);
  }
- if(x1<=x0||y1<=y0)return;
+ if(!count)throw Error('目标 S0 在当前切片中没有像素');
+ const full=p.meta.focus;
+ if(full){
+  const [ox,oy]=p.meta.bbox_xy;
+  const expected=full.bbox_xy.map((v,i)=>v-(i%2?oy:ox));
+  if(full.s0_id!==id||full.pixel_count!==count||expected.some((v,i)=>v!==[x0,y0,x1,y1][i]))
+   throw Error('S0 切片数据不完整，请重新加载');
+ }
  card.focusBounds=[x0,y0,x1,y1];card.focusId=id;card.freeCenter=true;
 }
 function resetZoom(card){
- card.focusBounds=null;card.focusId=null;card.requestedFocusId=null;card.freeCenter=false;card.maxZoom=16;
+ card.focusBounds=null;card.focusId=null;card.requestedFocusId=null;card.freeCenter=false;card.maxZoom=16;card.minZoom=1;
  card.zoom=1;card.cx=(card.surface?.width||0)/2;card.cy=(card.surface?.height||0)/2;
  fitCanvas(card);
 }
 function zoomAt(card,event){
  if(!card.surface||!event.deltaY)return;
- const rect=card.canvas.getBoundingClientRect();if(!rect.width||!rect.height)return;
+ const rect=card.canvas.parentElement.getBoundingClientRect();if(!rect.width||!rect.height)return;
+ card.renderDpr=1;
  const old=viewTransform(card,rect.width,rect.height),x=event.clientX-rect.left,y=event.clientY-rect.top;
  const px=(x-old.x)/old.s,py=(y-old.y)/old.s;
  const delta=event.deltaY*(event.deltaMode===1?16:event.deltaMode===2?rect.height:1);
- const zoom=Math.max(1,Math.min(card.maxZoom||16,card.zoom*Math.exp(-Math.max(-120,Math.min(120,delta))*.002)));
+ const zoom=Math.max(card.minZoom||1,Math.min(card.maxZoom||16,card.zoom*Math.exp(-Math.max(-120,Math.min(120,delta))*.002)));
  if(zoom===card.zoom)return;
  card.focusBounds=null;
  const s=old.s*zoom/card.zoom;card.zoom=zoom;
@@ -89,7 +102,9 @@ function zoomAt(card,event){
 }
 function fitCanvas(card){
  if(!card.surface)return;
- const canvas=card.canvas,rect=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1;
+ const canvas=card.canvas,rect=canvas.parentElement.getBoundingClientRect(),dpr=window.devicePixelRatio||1;
+ if(!rect.width||!rect.height)return;
+ card.renderDpr=dpr;
  canvas.width=Math.max(1,Math.round(rect.width*dpr));canvas.height=Math.max(1,Math.round(rect.height*dpr));
  const ctx=canvas.getContext('2d'),{s,x,y}=viewTransform(card,canvas.width,canvas.height);
  ctx.fillStyle='#171d26';ctx.fillRect(0,0,canvas.width,canvas.height);ctx.imageSmoothingEnabled=false;
@@ -124,12 +139,13 @@ async function loadFrame(card,z,focusId=null){
  card.controller?.abort();card.controller=new AbortController();const ticket=++card.ticket;
  card.z=z;card.requestedFocusId=focusId;controls(card);const message=card.root.querySelector('.image-message');message.textContent='正在加载切片…';message.classList.remove('failed');
  try{
-  const response=await fetch(`/api/frame/${card.row.gt_id}/${z}`,{signal:card.controller.signal});
+  const query=focusId===null?'':'?'+new URLSearchParams({focus_s0_id:focusId});
+  const response=await fetch(`/api/frame/${card.row.gt_id}/${z}${query}`,{signal:card.controller.signal});
   if(!response.ok)throw Error(await response.text());const p=decodeFrame(await response.arrayBuffer());
   if(ticket!==card.ticket||!card.root.isConnected)return;
   // Each Z has its own crop; fit the new crop instead of reusing old coordinates.
   card.zoom=1;card.cx=p.w/2;card.cy=p.h/2;
-  card.focusBounds=null;card.focusId=null;card.freeCenter=false;card.maxZoom=16;
+  card.focusBounds=null;card.focusId=null;card.freeCenter=false;card.maxZoom=16;card.minZoom=1;
   card.frame=p;if(focusId!==null)focusS0(card,focusId);
   paint(card);metadata(card);message.textContent='';
  }catch(error){if(error.name!=='AbortError'&&ticket===card.ticket){message.textContent='加载失败，点击重试：'+error.message;message.classList.add('failed');}}
@@ -174,10 +190,12 @@ function makeCard(row,container,isDetail=false,startZ=null,startFocusId=null){
  canvas.onkeydown=e=>{if(['ArrowDown','ArrowRight','ArrowUp','ArrowLeft'].includes(e.key)){e.preventDefault();step(card,['ArrowDown','ArrowRight'].includes(e.key)?1:-1);}else if(e.key.toLowerCase()==='f'){e.preventDefault();resetZoom(card);}else if(!isDetail&&(e.key==='Enter'||e.key===' ')){e.preventDefault();openDetail(card);}};
  if(!isDetail)canvas.onclick=()=>openDetail(card);
  container.append(root);controls(card);
+ card.resizeObserver=new ResizeObserver(()=>fitCanvas(card));
+ card.resizeObserver.observe(canvas.parentElement);
  if(card.z!=null)loadFrame(card,card.z,startFocusId);else{root.querySelector('.image-message').textContent='GT 不在源数据中';root.querySelector('.coverage').textContent='请核对 CSV 与源数据版本';}
  return card;
 }
-function closeDetail(){if($('detail').open)$('detail').close();state.detail?.controller?.abort();state.detail=null;$('detail-body').replaceChildren();}
+function closeDetail(){if($('detail').open)$('detail').close();state.detail?.controller?.abort();state.detail?.resizeObserver?.disconnect();state.detail=null;$('detail-body').replaceChildren();}
 function openDetail(card){closeDetail();$('detail').showModal();state.detail=makeCard(card.row,$('detail-body'),true,card.z,card.requestedFocusId??card.focusId);}
 function pagination(){
  $('page-number').value=state.page;$('page-number').max=state.pages;$('pages').textContent=state.pages;
@@ -186,7 +204,7 @@ function pagination(){
 async function loadPage(){
  const ticket=++state.ticket;closeDetail();state.pageController?.abort();state.pageController=new AbortController();
  const signal=state.pageController.signal;
- for(const card of state.cards)card.controller?.abort();state.cards=[];$('gallery').replaceChildren();$('empty').hidden=true;showError('');
+ for(const card of state.cards){card.controller?.abort();card.resizeObserver?.disconnect();}state.cards=[];$('gallery').replaceChildren();$('empty').hidden=true;showError('');
  $('prev-page').disabled=true;$('next-page').disabled=true;$('result-count').textContent='';
  for(const button of document.querySelectorAll('[data-tag]'))button.setAttribute('aria-pressed',String(button.dataset.tag===state.tag));
  [$('heading').textContent,$('description').textContent]=descriptions[state.tag];$('status').textContent='正在定位 GT 与关联 S0…';

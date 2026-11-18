@@ -164,12 +164,14 @@ class Gallery:
             self.plans[gt_id] = plan_slices(self.by_id[gt_id], self.index)
         return self.plans[gt_id]
 
-    def frame(self, gt_id, z):
+    def frame(self, gt_id, z, focus_s0_id=None):
         if gt_id not in self.by_id:
             raise HTTPException(404, 'GT is not in cluster CSV')
         if not 0 <= z < self.shape[0]:
             raise HTTPException(400, 'Z out of range')
         row = self.by_id[gt_id]
+        if focus_s0_id is not None and focus_s0_id not in row['covered_s0_id']:
+            raise HTTPException(400, 'Focused S0 must belong to this CSV row')
         with self.frame_lock:
             if z not in self.cache:
                 with h5py.File(self.directory / 'em.h5', 'r') as f:
@@ -189,7 +191,16 @@ class Gallery:
             pos = np.searchsorted(sorted_ids, self.s0[z])
             pos = np.minimum(pos, len(ids) - 1)
             slots = np.where(sorted_ids[pos] == self.s0[z], order[pos], 0).astype('<u4')
-            yy, xx = np.nonzero(gmask | (slots != 0))
+            focus = None
+            if focus_s0_id is not None:
+                # Locate in the original full plane, before any display crop.
+                yy, xx = np.nonzero(self.s0[z] == int(focus_s0_id))
+                if not len(xx):
+                    raise HTTPException(404, 'Focused S0 is absent from this Z slice')
+                focus = dict(s0_id=focus_s0_id, pixel_count=len(xx),
+                             bbox_xy=[int(xx.min()), int(yy.min()), int(xx.max())+1, int(yy.max())+1])
+            else:
+                yy, xx = np.nonzero(gmask | (slots != 0))
             if not len(xx):
                 x0, y0, x1, y1 = 0, 0, self.shape[2], self.shape[1]
             else:
@@ -203,7 +214,8 @@ class Gallery:
             present = set(np.unique(slots).tolist()) - {0}
             meta = dict(z=z, gt_id=gt_id, gt_present=bool(gmask.any()), gt_colour=gc,
                         s0_ids=[str(i) for i in ids], s0_colours=sc,
-                        present_s0=[str(ids[i]) for i in sorted(present)], bbox_xy=[x0, y0, x1, y1])
+                        present_s0=[str(ids[i]) for i in sorted(present)], bbox_xy=[x0, y0, x1, y1],
+                        focus=focus)
             header = json.dumps(meta, separators=(',', ':')).encode()
             return (struct.pack('<4sIII', b'GSV1', x1-x0, y1-y0, len(header)) + header
                     + em.tobytes() + gmask.astype(np.uint8).tobytes() + slots.tobytes())
@@ -228,11 +240,11 @@ def make_app(directory, cluster, em_key='inputs', gt_key='labels'):
 
     @app.get('/app.js')
     def script():
-        return FileResponse(HERE / 'app.js', media_type='text/javascript')
+        return FileResponse(HERE / 'app.js', media_type='text/javascript', headers={'Cache-Control': 'no-store'})
 
     @app.get('/style.css')
     def style():
-        return FileResponse(HERE / 'style.css', media_type='text/css')
+        return FileResponse(HERE / 'style.css', media_type='text/css', headers={'Cache-Control': 'no-store'})
 
     @app.get('/api/info')
     def info():
@@ -256,8 +268,8 @@ def make_app(directory, cluster, em_key='inputs', gt_key='labels'):
                     items=[gallery.plan(row['gt_id']) for row in rows[(page-1)*PAGE_SIZE:page*PAGE_SIZE]])
 
     @app.get('/api/frame/{gt_id}/{z}')
-    def frame(gt_id: str, z: int):
-        return Response(gallery.frame(gt_id, z), media_type='application/octet-stream')
+    def frame(gt_id: str, z: int, focus_s0_id: str | None = None):
+        return Response(gallery.frame(gt_id, z, focus_s0_id), media_type='application/octet-stream')
 
     return app
 

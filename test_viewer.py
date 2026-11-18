@@ -51,6 +51,33 @@ def make_fixture(root):
 
 
 class ViewerTests(unittest.TestCase):
+    def test_focused_frame_includes_all_pixels_and_disconnected_parts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, s0 = make_fixture(root)
+            # S0 extends far beyond GT, with separate parts touching opposite edges.
+            s0[0, 0, 0] = 101
+            s0[0, 23, 31] = 101
+            np.save(root / 's0.npy', s0)
+            gallery = Gallery(root, root / 'cluster.csv')
+            try:
+                for gt_id, z, label in [('1', 0, '101'), ('1', 1, '102'), (str(2**63+17), 0, str(2**63+17))]:
+                    payload = gallery.frame(gt_id, z, label)
+                    _, w, h, n = struct.unpack('<4sIII', payload[:16])
+                    meta = json.loads(payload[16:16+n])
+                    focus = meta['focus']
+                    expected = s0[z] == int(label)
+                    yy, xx = np.nonzero(expected)
+                    self.assertEqual(focus['pixel_count'], int(expected.sum()))
+                    self.assertEqual(focus['bbox_xy'], [int(xx.min()), int(yy.min()), int(xx.max())+1, int(yy.max())+1])
+                    x0, y0, x1, y1 = meta['bbox_xy']
+                    slots = np.frombuffer(payload, dtype='<u4', offset=16+n+2*w*h).reshape(h,w)
+                    mask = slots == meta['s0_ids'].index(label)
+                    self.assertEqual(int(mask.sum()), int(expected.sum()))
+                    self.assertTrue(np.array_equal(mask, expected[y0:y1,x0:x1]))
+            finally:
+                gallery.close()
+
     def test_joint_slice_cover_includes_every_coexistent_s0(self):
         row = dict(gt_id='1', tag='1vn', s0_count_per_gt=5, covered_s0_id=['11', '12', '13', '14', '15'])
         index = {'gt': {1: {0: 4, 1: 9, 2: 10}}, 's0': {
@@ -135,6 +162,12 @@ class ViewerTests(unittest.TestCase):
                     self.assertEqual(client.get(url).status_code, 400, url)
                 self.assertEqual(client.get('/api/frame/10000/0').status_code, 404)
                 self.assertEqual(client.get('/api/frame/1/0').content[:4], b'GSV1')
+                focused = client.get('/api/frame/1/0?focus_s0_id=101')
+                self.assertEqual(focused.status_code, 200)
+                n = struct.unpack('<4sIII', focused.content[:16])[3]
+                self.assertEqual(json.loads(focused.content[16:16+n])['focus']['pixel_count'], 16)
+                self.assertEqual(client.get('/api/frame/1/0?focus_s0_id=102').status_code, 404)
+                self.assertEqual(client.get('/api/frame/1/0?focus_s0_id=12345').status_code, 400)
                 for url in ['/', '/app.js', '/style.css']:
                     self.assertEqual(client.get(url).status_code, 200)
 
