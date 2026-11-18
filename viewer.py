@@ -62,7 +62,18 @@ def read_clusters(path):
     return rows
 
 
-def plan_slices(row, index):
+def overlap_counts(gt, s0, wanted):
+    """Exact uint64 pair counts; sharing a Z or touching edges is not overlap."""
+    valid = (gt != 0) & (s0 != 0)
+    pairs = np.empty(int(valid.sum()), dtype=[('gt', '<u8'), ('s0', '<u8')])
+    pairs['gt'], pairs['s0'] = gt[valid], s0[valid]
+    unique, counts = np.unique(pairs, return_counts=True)
+    return {(int(pair['gt']), int(pair['s0'])): int(count)
+            for pair, count in zip(unique, counts)
+            if int(pair['s0']) in wanted.get(int(pair['gt']), ())}
+
+
+def plan_slices(row, index, overlaps=None):
     """All joint Zs + a greedy cover of every S0 that shares any Z with GT."""
     gg = index['gt'].get(int(row['gt_id']), {})
     ss = {s: index['s0'].get(int(s), {}) for s in row['covered_s0_id']}
@@ -81,11 +92,29 @@ def plan_slices(row, index):
         remaining.difference_update(best['s0_ids'])
     if not recommended and best_gt is not None:
         recommended = [best_gt]
+    overlaps = overlaps or {}
+    targets, no_overlap = {}, []
+    for s, zs in ss.items():
+        common = overlaps.get(int(s), {})
+        preferred = next((z for z in recommended if common.get(z, 0) > 0), None)
+        if preferred is not None:
+            z, reason = preferred, 'recommended_overlap'
+        elif common:
+            z = max(common, key=lambda z: (common[z], zs.get(z, 0), -z))
+            reason = 'other_overlap'
+        else:
+            z = max(zs, key=lambda z: (zs[z], -z)) if zs else None
+            reason = 'no_overlap' if zs else 'missing'
+            if zs and gg:
+                no_overlap.append(s)
+        targets[s] = dict(z=z, reason=reason, overlap_pixels=common.get(z, 0),
+                          overlap_by_z=common)
     return dict(**row, gt_missing=not bool(gg), missing_s0=missing, disjoint_s0=disjoint,
                 slices=joint if joint else [{'z': z, 's0_ids': []} for z in sorted(gg)],
                 recommended_z=recommended, initial_z=recommended[0] if recommended else None,
                 all_together=bool(ss) and any(len(item['s0_ids']) == len(ss) for item in joint),
                 gt_slices=sorted(gg),
+                s0_targets=targets, no_overlap_s0=no_overlap,
                 s0_locations={s: max(zs, key=lambda z: (zs[z], -z)) for s, zs in ss.items() if zs})
 
 
@@ -103,6 +132,7 @@ class Gallery:
             self.s0._mmap.close()
             raise
         self.index = {'gt': {}, 's0': {}}
+        self.overlaps = {}
         self.state, self.done, self.error = 'idle', 0, None
         self.index_lock, self.frame_lock = threading.Lock(), threading.Lock()
         self.index_thread = None
@@ -132,19 +162,25 @@ class Gallery:
             wanted = {'gt': {int(r['gt_id']) for r in self.rows},
                       's0': {int(s) for r in self.rows for s in r['covered_s0_id']}}
             index = {'gt': {}, 's0': {}}
+            wanted_pairs = {int(r['gt_id']): {int(s) for s in r['covered_s0_id']} for r in self.rows}
+            overlaps = {}
             with h5py.File(self.directory / 'gt.h5', 'r') as gt:
                 for z in range(self.shape[0]):
-                    for source, plane in (('gt', gt[self.gt_key][z]), ('s0', self.s0[z])):
+                    gt_plane, s0_plane = gt[self.gt_key][z], self.s0[z]
+                    for source, plane in (('gt', gt_plane), ('s0', s0_plane)):
                         ids, counts = np.unique(plane, return_counts=True)
                         if ids[0] < 0:
                             raise ValueError('Negative segmentation labels are unsupported')
                         for label, count in zip(ids, counts):
                             if int(label) in wanted[source]:
                                 index[source].setdefault(int(label), {})[z] = int(count)
+                    for (g, s), count in overlap_counts(gt_plane, s0_plane, wanted_pairs).items():
+                        overlaps.setdefault(g, {}).setdefault(s, {})[z] = count
                     with self.index_lock:
                         self.done = z + 1
             with self.index_lock:
                 self.index, self.state = index, 'ready'
+                self.overlaps = overlaps
         except Exception as exc:
             with self.index_lock:
                 self.state, self.error = 'error', str(exc)
@@ -161,7 +197,7 @@ class Gallery:
         if gt_id not in self.by_id:
             raise HTTPException(404, 'GT is not in cluster CSV')
         if gt_id not in self.plans:
-            self.plans[gt_id] = plan_slices(self.by_id[gt_id], self.index)
+            self.plans[gt_id] = plan_slices(self.by_id[gt_id], self.index, self.overlaps.get(int(gt_id), {}))
         return self.plans[gt_id]
 
     def frame(self, gt_id, z, focus_s0_id=None):
@@ -197,7 +233,7 @@ class Gallery:
                 yy, xx = np.nonzero(self.s0[z] == int(focus_s0_id))
                 if not len(xx):
                     raise HTTPException(404, 'Focused S0 is absent from this Z slice')
-                focus = dict(s0_id=focus_s0_id, pixel_count=len(xx),
+                focus = dict(s0_id=focus_s0_id, pixel_count=len(xx), overlap_pixels=int(gmask[yy, xx].sum()),
                              bbox_xy=[int(xx.min()), int(yy.min()), int(xx.max())+1, int(yy.max())+1])
             else:
                 yy, xx = np.nonzero(gmask | (slots != 0))

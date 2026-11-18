@@ -129,6 +129,8 @@ function metadata(card){
  const {root,row,frame:p}=card;
  const present=new Set(p.meta.present_s0),n=row.covered_s0_id.length;
  root.querySelector('.coverage').textContent=row.tag==='1v0'?'仅 GT · 无关联 S0':`当前可见 S0：${present.size} / ${n}`+(p.meta.gt_present?' · GT 在场':' · GT 不在此切片');
+ if(card.focusId&&p.meta.focus?.overlap_pixels!=null)
+  root.querySelector('.coverage').textContent+=` · 目标 S0 与 GT 重叠 ${p.meta.focus.overlap_pixels} px`;
  const legend=root.querySelector('.legend');legend.replaceChildren(swatch(p.meta.gt_present?'GT':'GT 不在场',p.meta.gt_colour,true));
  for(const id of p.meta.present_s0.slice(0,3)){const i=p.meta.s0_ids.indexOf(id);legend.append(swatch(`S0 ${id}`,p.meta.s0_colours[i]));}
  if(p.meta.present_s0.length>3){const more=document.createElement('span');more.textContent=`+${p.meta.present_s0.length-3} 个`;legend.append(more);}
@@ -154,6 +156,12 @@ function step(card,delta){
  if(!card.zs.length)return;const i=card.zs.indexOf(card.z),next=Math.max(0,Math.min(card.zs.length-1,i+delta));
  if(card.zs[next]!==card.z)loadFrame(card,card.zs[next]);
 }
+function s0Location(row,id,currentZ){
+ const target=row.s0_targets?.[id];
+ if(!target)throw Error('后端缺少 GT/S0 交集索引，请更新并重启查看器服务');
+ // Preserve a currently selected slice only when this exact pair overlaps there.
+ return (target.overlap_by_z?.[currentZ]||0)>0?currentZ:target.z;
+}
 function makeCard(row,container,isDetail=false,startZ=null,startFocusId=null){
  const root=$('card-template').content.firstElementChild.cloneNode(true),canvas=root.querySelector('canvas');
  const card={root,canvas,row,z:startZ??row.initial_z,zs:row.slices.map(s=>s.z),ticket:0,frame:null,surface:null,controller:null,zoom:1,cx:0,cy:0};
@@ -164,6 +172,8 @@ function makeCard(row,container,isDetail=false,startZ=null,startFocusId=null){
  if(row.gt_missing)warnings.push('源数据中找不到该 GT。');
  if(row.missing_s0.length)warnings.push(`缺失 S0：${row.missing_s0.join('、')}。`);
  if(row.disjoint_s0.length)warnings.push(`无共同 Z 的 S0：${row.disjoint_s0.join('、')}；可在下方列表单独定位。`);
+ const neverOverlap=(row.no_overlap_s0||[]).filter(id=>!row.disjoint_s0.includes(id));
+ if(neverOverlap.length)warnings.push(`全体积内与此 GT 没有像素交集的 S0：${neverOverlap.join('、')}；点击仅定位 S0 本体。`);
  if(row.s0_count_per_gt!==row.covered_s0_id.length)warnings.push(`CSV 计数为 ${row.s0_count_per_gt}，实际列表含 ${row.covered_s0_id.length} 个；按列表显示。`);
  if(row.tag!=='1v0'&&!row.all_together&&!row.gt_missing)warnings.push('无法让全部 S0 与 GT 同处一个 Z，请浏览代表切片。');
  const warning=root.querySelector('.warning');warning.textContent=warnings.join(' ');warning.hidden=!warnings.length;
@@ -173,9 +183,9 @@ function makeCard(row,container,isDetail=false,startZ=null,startFocusId=null){
  root.querySelector('.s0-details').hidden=!row.covered_s0_id.length;
  for(const id of row.covered_s0_id){
   const b=document.createElement('button');b.dataset.id=id;b.textContent=id;b.disabled=row.s0_locations[id]==null;
-  const joint=row.slices.filter(s=>s.s0_ids.includes(id));
-  b.title=b.disabled?'源数据中缺失':joint.length?'切换到共存切片，将此 S0 完整放大并居中':'将此 S0 完整放大并居中（GT 不在场）';
-  b.onclick=()=>loadFrame(card,(joint.find(s=>row.recommended_z.includes(s.z))||joint[0])?.z??row.s0_locations[id],id);
+  const target=row.s0_targets?.[id];
+  b.title=b.disabled?'源数据中缺失':target?.reason==='no_overlap'?'全体积无交集，仅将 S0 本体完整放大并居中':'优先在已选切片定位交集；否则跳到其他有交集的切片，完整显示 S0';
+  b.onclick=()=>{try{loadFrame(card,s0Location(row,id,card.z),id);}catch(error){showError(error.message);}};
   root.querySelector('.s0-list').append(b);
  }
  const scope=root.querySelector('.slice-scope');

@@ -10,7 +10,7 @@ import h5py
 import numpy as np
 from fastapi.testclient import TestClient
 
-from viewer import FIELDS, Gallery, make_app, plan_slices, read_clusters
+from viewer import FIELDS, Gallery, make_app, overlap_counts, plan_slices, read_clusters
 
 
 def write_csv(path, rows):
@@ -51,6 +51,60 @@ def make_fixture(root):
 
 
 class ViewerTests(unittest.TestCase):
+    def test_api_locates_overlap_outside_representative_slices(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            gt = np.zeros((3, 12, 12), dtype=np.uint64)
+            gt[:, 4:8, 4:8] = 9
+            s0 = np.zeros_like(gt)
+            s0[0, :3, :3] = 1997  # Same Z as GT, no shared pixel.
+            s0[0, 4:8, 4:8] = 12  # Makes Z=0 the sole representative slice.
+            s0[1, 4:6, 4:6] = 1997
+            s0[2, 4:8, 4:8] = 1997
+            for filename, key, array in [('em.h5', 'inputs', np.zeros(gt.shape, dtype=np.uint8)),
+                                         ('gt.h5', 'labels', gt)]:
+                with h5py.File(root / filename, 'w') as f:
+                    f[key] = array
+            np.save(root / 's0.npy', s0)
+            write_csv(root / 'cluster.csv', [[9, '1vn', 2, '1997,12']])
+            app = make_app(root, root / 'cluster.csv')
+            app.state.gallery.build_index()
+            with TestClient(app) as client:
+                row = client.get('/api/clusters?tag=1vn').json()['items'][0]
+                self.assertEqual(row['recommended_z'], [0])
+                self.assertEqual(row['s0_targets']['1997']['z'], 2)
+                self.assertEqual(row['s0_targets']['1997']['overlap_by_z'], {'1': 4, '2': 16})
+                self.assertEqual(row['s0_targets']['12']['z'], 0)
+                response = client.get('/api/frame/9/2?focus_s0_id=1997')
+                n = struct.unpack('<4sIII', response.content[:16])[3]
+                self.assertEqual(json.loads(response.content[16:16+n])['focus']['overlap_pixels'], 16)
+
+    def test_s0_location_prefers_actual_overlap_in_selected_slices(self):
+        row = dict(gt_id='9', tag='1vn', s0_count_per_gt=5,
+                   covered_s0_id=['1997', '12', '13', '14', '15'])
+        index = {'gt': {9: {92: 100, 93: 100, 97: 100}}, 's0': {
+            1997: {92: 200, 93: 300, 97: 400}, 12: {92: 40, 97: 90},
+            13: {92: 4}, 14: {99: 8}}}
+        plan = plan_slices(row, index, {1997: {93: 10, 97: 20}, 12: {92: 3, 97: 30}})
+        self.assertEqual(plan['recommended_z'], [92])
+        self.assertEqual(plan['s0_targets']['1997']['z'], 97)
+        self.assertEqual(plan['s0_targets']['1997']['reason'], 'other_overlap')
+        # A selected slice with a real intersection takes precedence over larger overlaps elsewhere.
+        self.assertEqual(plan['s0_targets']['12']['z'], 92)
+        self.assertEqual(plan['s0_targets']['12']['reason'], 'recommended_overlap')
+        self.assertEqual(plan['s0_targets']['13']['reason'], 'no_overlap')
+        self.assertEqual(plan['s0_targets']['14']['z'], 99)
+        self.assertIsNone(plan['s0_targets']['15']['z'])
+        self.assertEqual(plan['no_overlap_s0'], ['13', '14'])
+
+    def test_overlap_index_counts_pixels_not_same_z_or_edge_contact(self):
+        large = 2**63 + 17
+        gt = np.array([[9, 9, 0, large], [0, 9, 0, large+1]], dtype=np.uint64)
+        s0 = np.array([[1997, 0, 1997, large+1], [12, 12, 1997, large]], dtype=np.uint64)
+        counts = overlap_counts(gt, s0, {9: {1997,12}, large: {large+1}, large+1: {large}})
+        self.assertEqual(counts, {(9,1997):1, (9,12):1, (large,large+1):1, (large+1,large):1})
+        self.assertEqual(overlap_counts(gt, np.zeros_like(s0), {9:{1997}}), {})
+
     def test_focused_frame_includes_all_pixels_and_disconnected_parts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -121,6 +175,8 @@ class ViewerTests(unittest.TestCase):
             self.assertEqual(plan['recommended_z'], [0, 1, 2])
             self.assertEqual(plan['missing_s0'], ['999'])
             self.assertEqual(plan['disjoint_s0'], ['104'])
+            self.assertEqual(plan['s0_targets']['101']['overlap_by_z'], {0: 16})
+            self.assertEqual(plan['s0_targets']['104']['reason'], 'no_overlap')
             large = str(2**63 + 17)
             payload = v.frame(large, 0)
             magic, w, h, n = struct.unpack('<4sIII', payload[:16])
@@ -166,6 +222,7 @@ class ViewerTests(unittest.TestCase):
                 self.assertEqual(focused.status_code, 200)
                 n = struct.unpack('<4sIII', focused.content[:16])[3]
                 self.assertEqual(json.loads(focused.content[16:16+n])['focus']['pixel_count'], 16)
+                self.assertEqual(json.loads(focused.content[16:16+n])['focus']['overlap_pixels'], 16)
                 self.assertEqual(client.get('/api/frame/1/0?focus_s0_id=102').status_code, 404)
                 self.assertEqual(client.get('/api/frame/1/0?focus_s0_id=12345').status_code, 400)
                 for url in ['/', '/app.js', '/style.css']:
