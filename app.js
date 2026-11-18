@@ -4,7 +4,7 @@ const state = {tag:'1v0', page:1, pages:1, ticket:0, cards:[], detail:null, opac
 const descriptions = {
  '1v0':['未关联 S0 的 GT','每张卡片对应一个 GT，默认显示 GT 面积最大的切片。'],
  '1v1':['一对一的 GT / S0','默认定位二者共同出现的切片，在同一张 EM 上对照。'],
- '1vn':['关联多个对象的 GT','优先展示最多关联 S0；通过代表切片与滚轮浏览其余 S0。']
+ '1vn':['关联多个对象的 GT','优先展示最多关联 S0；通过代表切片与切片控件浏览其余 S0。']
 };
 async function json(url, signal) {
  const response=await fetch(url,{signal});
@@ -41,13 +41,37 @@ function paint(card){
  }
  ctx.putImageData(img,0,0);card.surface=surface;fitCanvas(card);
 }
+function viewTransform(card,width,height){
+ const s=Math.min(width/card.surface.width,height/card.surface.height)*card.zoom;
+ // Keep the image centred on axes where it is smaller than the viewport.
+ const hx=Math.min(card.surface.width/2,width/(2*s)),hy=Math.min(card.surface.height/2,height/(2*s));
+ card.cx=Math.max(hx,Math.min(card.surface.width-hx,card.cx));
+ card.cy=Math.max(hy,Math.min(card.surface.height-hy,card.cy));
+ return {s,x:width/2-card.cx*s,y:height/2-card.cy*s};
+}
+function resetZoom(card){
+ card.zoom=1;card.cx=(card.surface?.width||0)/2;card.cy=(card.surface?.height||0)/2;
+ fitCanvas(card);
+}
+function zoomAt(card,event){
+ if(!card.surface||!event.deltaY)return;
+ const rect=card.canvas.getBoundingClientRect();if(!rect.width||!rect.height)return;
+ const old=viewTransform(card,rect.width,rect.height),x=event.clientX-rect.left,y=event.clientY-rect.top;
+ const px=(x-old.x)/old.s,py=(y-old.y)/old.s;
+ const delta=event.deltaY*(event.deltaMode===1?16:event.deltaMode===2?rect.height:1);
+ const zoom=Math.max(1,Math.min(16,card.zoom*Math.exp(-Math.max(-120,Math.min(120,delta))*.002)));
+ if(zoom===card.zoom)return;
+ const s=old.s*zoom/card.zoom;card.zoom=zoom;
+ card.cx=px-(x-rect.width/2)/s;card.cy=py-(y-rect.height/2)/s;
+ fitCanvas(card);
+}
 function fitCanvas(card){
  if(!card.surface)return;
  const canvas=card.canvas,rect=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1;
  canvas.width=Math.max(1,Math.round(rect.width*dpr));canvas.height=Math.max(1,Math.round(rect.height*dpr));
- const ctx=canvas.getContext('2d'),s=Math.min(canvas.width/card.surface.width,canvas.height/card.surface.height);
+ const ctx=canvas.getContext('2d'),{s,x,y}=viewTransform(card,canvas.width,canvas.height);
  ctx.fillStyle='#171d26';ctx.fillRect(0,0,canvas.width,canvas.height);ctx.imageSmoothingEnabled=false;
- ctx.drawImage(card.surface,(canvas.width-card.surface.width*s)/2,(canvas.height-card.surface.height*s)/2,card.surface.width*s,card.surface.height*s);
+ ctx.drawImage(card.surface,x,y,card.surface.width*s,card.surface.height*s);
 }
 function swatch(text,colour,outline=false){
  const span=document.createElement('span'),i=document.createElement('i');i.className='swatch';
@@ -81,6 +105,8 @@ async function loadFrame(card,z){
   const response=await fetch(`/api/frame/${card.row.gt_id}/${z}`,{signal:card.controller.signal});
   if(!response.ok)throw Error(await response.text());const p=decodeFrame(await response.arrayBuffer());
   if(ticket!==card.ticket||!card.root.isConnected)return;
+  // Each Z has its own crop; fit the new crop instead of reusing old coordinates.
+  card.zoom=1;card.cx=p.w/2;card.cy=p.h/2;
   card.frame=p;paint(card);metadata(card);message.textContent='';
  }catch(error){if(error.name!=='AbortError'&&ticket===card.ticket){message.textContent='加载失败，点击重试：'+error.message;message.classList.add('failed');}}
 }
@@ -90,10 +116,10 @@ function step(card,delta){
 }
 function makeCard(row,container,isDetail=false,startZ=null){
  const root=$('card-template').content.firstElementChild.cloneNode(true),canvas=root.querySelector('canvas');
- const card={root,canvas,row,z:startZ??row.initial_z,zs:row.slices.map(s=>s.z),ticket:0,frame:null,surface:null,controller:null};
+ const card={root,canvas,row,z:startZ??row.initial_z,zs:row.slices.map(s=>s.z),ticket:0,frame:null,surface:null,controller:null,zoom:1,cx:0,cy:0};
  root.querySelector('h3').textContent=`GT ${row.gt_id}`;
  root.querySelector('.tag-pill').textContent=row.tag==='1v0'?'1v0':`${row.tag} · ${row.covered_s0_id.length} S0`;
- canvas.setAttribute('aria-label',`GT ${row.gt_id} EM 图，滚轮或方向键换切片，Enter 放大`);
+ canvas.setAttribute('aria-label',`GT ${row.gt_id} EM 图，滚轮缩放，方向键换切片，F 适应画面${isDetail?'':'，Enter 查看大图'}`);
  const warnings=[];
  if(row.gt_missing)warnings.push('源数据中找不到该 GT。');
  if(row.missing_s0.length)warnings.push(`缺失 S0：${row.missing_s0.join('、')}。`);
@@ -118,10 +144,10 @@ function makeCard(row,container,isDetail=false,startZ=null){
  root.querySelector('.prev-slice').onclick=()=>step(card,-1);root.querySelector('.next-slice').onclick=()=>step(card,1);
  root.querySelector('.slice-range').oninput=e=>loadFrame(card,card.zs[Number(e.target.value)]);
  root.querySelector('.reset-slice').onclick=()=>loadFrame(card,row.initial_z);
+ root.querySelector('.fit-image').onclick=()=>resetZoom(card);
  root.querySelector('.image-message').onclick=()=>loadFrame(card,card.z);
- let lastWheel=0;
- canvas.addEventListener('wheel',e=>{e.preventDefault();if(Math.abs(e.deltaY)>0&&performance.now()-lastWheel>100){lastWheel=performance.now();step(card,e.deltaY>0?1:-1);}},{passive:false});
- canvas.onkeydown=e=>{if(['ArrowDown','ArrowRight','ArrowUp','ArrowLeft'].includes(e.key)){e.preventDefault();step(card,['ArrowDown','ArrowRight'].includes(e.key)?1:-1);}else if(!isDetail&&(e.key==='Enter'||e.key===' ')){e.preventDefault();openDetail(card);}};
+ canvas.addEventListener('wheel',e=>{e.preventDefault();zoomAt(card,e);},{passive:false});
+ canvas.onkeydown=e=>{if(['ArrowDown','ArrowRight','ArrowUp','ArrowLeft'].includes(e.key)){e.preventDefault();step(card,['ArrowDown','ArrowRight'].includes(e.key)?1:-1);}else if(e.key.toLowerCase()==='f'){e.preventDefault();resetZoom(card);}else if(!isDetail&&(e.key==='Enter'||e.key===' ')){e.preventDefault();openDetail(card);}};
  if(!isDetail)canvas.onclick=()=>openDetail(card);
  container.append(root);controls(card);
  if(card.z!=null)loadFrame(card,card.z);else{root.querySelector('.image-message').textContent='GT 不在源数据中';root.querySelector('.coverage').textContent='请核对 CSV 与源数据版本';}
