@@ -42,14 +42,35 @@ function paint(card){
  ctx.putImageData(img,0,0);card.surface=surface;fitCanvas(card);
 }
 function viewTransform(card,width,height){
+ if(card.focusBounds){
+  const [x0,y0,x1,y1]=card.focusBounds;
+  const base=Math.min(width/card.surface.width,height/card.surface.height);
+  // Fit the complete object (including disconnected parts) with 10% padding per side.
+  card.zoom=Math.max(1,Math.min(width/((x1-x0)*1.2),height/((y1-y0)*1.2))/base);
+  card.maxZoom=Math.max(16,card.zoom);
+  card.cx=(x0+x1)/2;card.cy=(y0+y1)/2;
+ }
  const s=Math.min(width/card.surface.width,height/card.surface.height)*card.zoom;
- // Keep the image centred on axes where it is smaller than the viewport.
- const hx=Math.min(card.surface.width/2,width/(2*s)),hy=Math.min(card.surface.height/2,height/(2*s));
- card.cx=Math.max(hx,Math.min(card.surface.width-hx,card.cx));
- card.cy=Math.max(hy,Math.min(card.surface.height-hy,card.cy));
+ // Focused objects near crop edges must still be centred; allow background margins.
+ if(!card.freeCenter){
+  const hx=Math.min(card.surface.width/2,width/(2*s)),hy=Math.min(card.surface.height/2,height/(2*s));
+  card.cx=Math.max(hx,Math.min(card.surface.width-hx,card.cx));
+  card.cy=Math.max(hy,Math.min(card.surface.height-hy,card.cy));
+ }
  return {s,x:width/2-card.cx*s,y:height/2-card.cy*s};
 }
+function focusS0(card,id){
+ const p=card.frame,slot=p.meta.s0_ids.indexOf(id);if(slot<=0)return;
+ let x0=p.w,y0=p.h,x1=0,y1=0;
+ for(let i=0;i<p.s0.length;i++)if(p.s0[i]===slot){
+  const x=i%p.w,y=Math.floor(i/p.w);
+  x0=Math.min(x0,x);y0=Math.min(y0,y);x1=Math.max(x1,x+1);y1=Math.max(y1,y+1);
+ }
+ if(x1<=x0||y1<=y0)return;
+ card.focusBounds=[x0,y0,x1,y1];card.focusId=id;card.freeCenter=true;
+}
 function resetZoom(card){
+ card.focusBounds=null;card.focusId=null;card.requestedFocusId=null;card.freeCenter=false;card.maxZoom=16;
  card.zoom=1;card.cx=(card.surface?.width||0)/2;card.cy=(card.surface?.height||0)/2;
  fitCanvas(card);
 }
@@ -59,8 +80,9 @@ function zoomAt(card,event){
  const old=viewTransform(card,rect.width,rect.height),x=event.clientX-rect.left,y=event.clientY-rect.top;
  const px=(x-old.x)/old.s,py=(y-old.y)/old.s;
  const delta=event.deltaY*(event.deltaMode===1?16:event.deltaMode===2?rect.height:1);
- const zoom=Math.max(1,Math.min(16,card.zoom*Math.exp(-Math.max(-120,Math.min(120,delta))*.002)));
+ const zoom=Math.max(1,Math.min(card.maxZoom||16,card.zoom*Math.exp(-Math.max(-120,Math.min(120,delta))*.002)));
  if(zoom===card.zoom)return;
+ card.focusBounds=null;
  const s=old.s*zoom/card.zoom;card.zoom=zoom;
  card.cx=px-(x-rect.width/2)/s;card.cy=py-(y-rect.height/2)/s;
  fitCanvas(card);
@@ -97,24 +119,26 @@ function metadata(card){
  if(p.meta.present_s0.length>3){const more=document.createElement('span');more.textContent=`+${p.meta.present_s0.length-3} 个`;legend.append(more);}
  for(const button of root.querySelectorAll('.s0-list button'))button.classList.toggle('present',present.has(button.dataset.id));
 }
-async function loadFrame(card,z){
+async function loadFrame(card,z,focusId=null){
  if(z==null)return;
  card.controller?.abort();card.controller=new AbortController();const ticket=++card.ticket;
- card.z=z;controls(card);const message=card.root.querySelector('.image-message');message.textContent='正在加载切片…';message.classList.remove('failed');
+ card.z=z;card.requestedFocusId=focusId;controls(card);const message=card.root.querySelector('.image-message');message.textContent='正在加载切片…';message.classList.remove('failed');
  try{
   const response=await fetch(`/api/frame/${card.row.gt_id}/${z}`,{signal:card.controller.signal});
   if(!response.ok)throw Error(await response.text());const p=decodeFrame(await response.arrayBuffer());
   if(ticket!==card.ticket||!card.root.isConnected)return;
   // Each Z has its own crop; fit the new crop instead of reusing old coordinates.
   card.zoom=1;card.cx=p.w/2;card.cy=p.h/2;
-  card.frame=p;paint(card);metadata(card);message.textContent='';
+  card.focusBounds=null;card.focusId=null;card.freeCenter=false;card.maxZoom=16;
+  card.frame=p;if(focusId!==null)focusS0(card,focusId);
+  paint(card);metadata(card);message.textContent='';
  }catch(error){if(error.name!=='AbortError'&&ticket===card.ticket){message.textContent='加载失败，点击重试：'+error.message;message.classList.add('failed');}}
 }
 function step(card,delta){
  if(!card.zs.length)return;const i=card.zs.indexOf(card.z),next=Math.max(0,Math.min(card.zs.length-1,i+delta));
  if(card.zs[next]!==card.z)loadFrame(card,card.zs[next]);
 }
-function makeCard(row,container,isDetail=false,startZ=null){
+function makeCard(row,container,isDetail=false,startZ=null,startFocusId=null){
  const root=$('card-template').content.firstElementChild.cloneNode(true),canvas=root.querySelector('canvas');
  const card={root,canvas,row,z:startZ??row.initial_z,zs:row.slices.map(s=>s.z),ticket:0,frame:null,surface:null,controller:null,zoom:1,cx:0,cy:0};
  root.querySelector('h3').textContent=`GT ${row.gt_id}`;
@@ -129,13 +153,13 @@ function makeCard(row,container,isDetail=false,startZ=null){
  const warning=root.querySelector('.warning');warning.textContent=warnings.join(' ');warning.hidden=!warnings.length;
  const recommendations=root.querySelector('.recommendations');
  for(const z of row.recommended_z){const b=document.createElement('button');b.textContent=`Z ${z}`;b.dataset.z=z;b.title=`代表切片 Z=${z}`;b.onclick=()=>loadFrame(card,z);recommendations.append(b);}
- root.querySelector('.s0-details summary').textContent=`关联 S0 列表 (${row.covered_s0_id.length}) · 点击定位`;
+ root.querySelector('.s0-details summary').textContent=`关联 S0 列表 (${row.covered_s0_id.length}) · 点击居中放大`;
  root.querySelector('.s0-details').hidden=!row.covered_s0_id.length;
  for(const id of row.covered_s0_id){
   const b=document.createElement('button');b.dataset.id=id;b.textContent=id;b.disabled=row.s0_locations[id]==null;
   const joint=row.slices.filter(s=>s.s0_ids.includes(id));
-  b.title=b.disabled?'源数据中缺失':joint.length?'定位与 GT 共存的切片':'单独定位 S0（GT 不在场）';
-  b.onclick=()=>loadFrame(card,(joint.find(s=>row.recommended_z.includes(s.z))||joint[0])?.z??row.s0_locations[id]);
+  b.title=b.disabled?'源数据中缺失':joint.length?'切换到共存切片，将此 S0 完整放大并居中':'将此 S0 完整放大并居中（GT 不在场）';
+  b.onclick=()=>loadFrame(card,(joint.find(s=>row.recommended_z.includes(s.z))||joint[0])?.z??row.s0_locations[id],id);
   root.querySelector('.s0-list').append(b);
  }
  const scope=root.querySelector('.slice-scope');
@@ -145,16 +169,16 @@ function makeCard(row,container,isDetail=false,startZ=null){
  root.querySelector('.slice-range').oninput=e=>loadFrame(card,card.zs[Number(e.target.value)]);
  root.querySelector('.reset-slice').onclick=()=>loadFrame(card,row.initial_z);
  root.querySelector('.fit-image').onclick=()=>resetZoom(card);
- root.querySelector('.image-message').onclick=()=>loadFrame(card,card.z);
+ root.querySelector('.image-message').onclick=()=>loadFrame(card,card.z,card.requestedFocusId);
  canvas.addEventListener('wheel',e=>{e.preventDefault();zoomAt(card,e);},{passive:false});
  canvas.onkeydown=e=>{if(['ArrowDown','ArrowRight','ArrowUp','ArrowLeft'].includes(e.key)){e.preventDefault();step(card,['ArrowDown','ArrowRight'].includes(e.key)?1:-1);}else if(e.key.toLowerCase()==='f'){e.preventDefault();resetZoom(card);}else if(!isDetail&&(e.key==='Enter'||e.key===' ')){e.preventDefault();openDetail(card);}};
  if(!isDetail)canvas.onclick=()=>openDetail(card);
  container.append(root);controls(card);
- if(card.z!=null)loadFrame(card,card.z);else{root.querySelector('.image-message').textContent='GT 不在源数据中';root.querySelector('.coverage').textContent='请核对 CSV 与源数据版本';}
+ if(card.z!=null)loadFrame(card,card.z,startFocusId);else{root.querySelector('.image-message').textContent='GT 不在源数据中';root.querySelector('.coverage').textContent='请核对 CSV 与源数据版本';}
  return card;
 }
 function closeDetail(){if($('detail').open)$('detail').close();state.detail?.controller?.abort();state.detail=null;$('detail-body').replaceChildren();}
-function openDetail(card){closeDetail();$('detail').showModal();state.detail=makeCard(card.row,$('detail-body'),true,card.z);}
+function openDetail(card){closeDetail();$('detail').showModal();state.detail=makeCard(card.row,$('detail-body'),true,card.z,card.requestedFocusId??card.focusId);}
 function pagination(){
  $('page-number').value=state.page;$('page-number').max=state.pages;$('pages').textContent=state.pages;
  $('prev-page').disabled=state.page<=1;$('next-page').disabled=state.page>=state.pages;
